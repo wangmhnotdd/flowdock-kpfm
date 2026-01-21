@@ -98,3 +98,10 @@ vandermers_max_surrogate_binding_affinity: 15.0
 vandermers_second_ligand_max_closeness: 10.0
 vandermers_extract_second_ligand: false
 vandermers_use_prob_as_surrogate_binding_affinity: false
+# KPFM-specific filtering parameters
+# These control which samples are suitable for KPFM training (semi-flexible assumption)
+kpfm_enable_filtering: false  # Set to true when training KPFM
+kpfm_max_backbone_rmsd: 3.0   # Max Cα RMSD between apo and holo (Å)
+kpfm_max_pocket_rmsd: 2.0     # Max Cα RMSD in binding pocket (Å)
+kpfm_min_aligned_fraction: 0.9  # Min fraction of residues aligned between apo/holo
+kpfm_pocket_cutoff: 10.0      # Distance cutoff for pocket residue detection (Å)

@@ -162,3 +162,5 @@ configs/local/default.yaml
 
 # Forks
 /forks/
+
+data/

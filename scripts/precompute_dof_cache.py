@@ -43,6 +43,11 @@ from flowdock.data.components.dof_utils import (
     CachedDOFData,
     TorsionDef,
 )
+from flowdock.data.components.topology_validator import (
+    validate_topology_full,
+    TopologyValidationResult,
+    ConformationalMetrics,
+)
 from flowdock.utils import RankedLogger
 
 log = RankedLogger(__name__, rank_zero_only=True)
@@ -109,6 +114,37 @@ def parse_args():
         action="store_true",
         help="Process only first 10 samples for debugging"
     )
+    # Topology validation and KPFM filtering
+    parser.add_argument(
+        "--enable_topology_validation",
+        action="store_true",
+        default=True,
+        help="Enable topology validation between holo and apo structures"
+    )
+    parser.add_argument(
+        "--kpfm_max_backbone_rmsd",
+        type=float,
+        default=3.0,
+        help="Maximum backbone RMSD for KPFM filtering (Angstroms)"
+    )
+    parser.add_argument(
+        "--kpfm_max_pocket_rmsd",
+        type=float,
+        default=2.0,
+        help="Maximum pocket RMSD for KPFM filtering (Angstroms)"
+    )
+    parser.add_argument(
+        "--kpfm_min_aligned_fraction",
+        type=float,
+        default=0.9,
+        help="Minimum aligned residue fraction for KPFM filtering"
+    )
+    parser.add_argument(
+        "--save_topology_report",
+        action="store_true",
+        default=True,
+        help="Save topology validation report to JSON"
+    )
     return parser.parse_args()
 
 
@@ -159,6 +195,10 @@ def process_single_sample(
     max_chi_angles: int,
     include_sidechains: bool,
     overwrite: bool,
+    enable_topology_validation: bool = True,
+    kpfm_max_backbone_rmsd: float = 3.0,
+    kpfm_max_pocket_rmsd: float = 2.0,
+    kpfm_min_aligned_fraction: float = 0.9,
 ) -> Dict[str, Any]:
     """Process a single sample and save DOF cache."""
     
@@ -168,6 +208,12 @@ def process_single_sample(
         "error": None,
         "n_ligand_torsions": 0,
         "n_sidechain_dofs": 0,
+        # Topology validation results
+        "topology_valid": None,
+        "backbone_rmsd": None,
+        "pocket_rmsd": None,
+        "aligned_fraction": None,
+        "passes_kpfm_filter": None,
     }
     
     # Check if cache already exists
@@ -220,12 +266,69 @@ def process_single_sample(
             kin_system=kin_system,
         )
         
+        # Topology validation (for KPFM filtering)
+        validation_result = None
+        if enable_topology_validation:
+            # Check if apo structure exists
+            apo_protein_file = None
+            if dataset == "pdbbind":
+                apo_dir = Path(data_dir).parent / "pdbbind_holo_aligned_esmfold_structures"
+                apo_protein_file = apo_dir / f"{sample_id}_holo_aligned_esmfold_protein.pdb"
+                if not apo_protein_file.exists():
+                    # Try alternative path
+                    apo_protein_file = sample_dir / f"{sample_id}_apo.pdb"
+            
+            if apo_protein_file and apo_protein_file.exists():
+                try:
+                    apo_coords, apo_atoms, apo_residue_info = load_protein_pdb(apo_protein_file)
+                    
+                    # Extract residue types
+                    holo_residue_types = [r['resname'] for r in residue_info]
+                    apo_residue_types = [r['resname'] for r in apo_residue_info]
+                    
+                    # Create simple atom37 masks (simplified - full implementation would 
+                    # use actual atom37 format)
+                    n_holo_res = len(residue_info)
+                    n_apo_res = len(apo_residue_info)
+                    holo_atom37_mask = np.ones((n_holo_res, 37), dtype=bool)  # Simplified
+                    apo_atom37_mask = np.ones((n_apo_res, 37), dtype=bool)    # Simplified
+                    
+                    # Run validation
+                    validation_result = validate_topology_full(
+                        holo_coords=protein_coords.reshape(n_holo_res, -1, 3)[:, :37, :],
+                        apo_coords=apo_coords.reshape(n_apo_res, -1, 3)[:, :37, :],
+                        holo_residue_types=holo_residue_types,
+                        apo_residue_types=apo_residue_types,
+                        holo_atom37_mask=holo_atom37_mask,
+                        apo_atom37_mask=apo_atom37_mask,
+                        ligand_coords=ligand_coords,
+                        kpfm_max_backbone_rmsd=kpfm_max_backbone_rmsd,
+                        kpfm_max_pocket_rmsd=kpfm_max_pocket_rmsd,
+                        kpfm_min_aligned_fraction=kpfm_min_aligned_fraction,
+                    )
+                    
+                    # Record results
+                    result["topology_valid"] = validation_result.is_valid
+                    if validation_result.conformational_metrics:
+                        result["backbone_rmsd"] = validation_result.conformational_metrics.backbone_rmsd
+                        result["pocket_rmsd"] = validation_result.conformational_metrics.pocket_backbone_rmsd
+                        result["aligned_fraction"] = validation_result.conformational_metrics.aligned_fraction
+                        result["passes_kpfm_filter"] = validation_result.conformational_metrics.passes_kpfm_filter(
+                            kpfm_max_backbone_rmsd, kpfm_max_pocket_rmsd, kpfm_min_aligned_fraction
+                        )
+                    
+                except Exception as e:
+                    log.warning(f"Topology validation failed for {sample_id}: {e}")
+                    result["topology_valid"] = False
+                    result["error"] = f"Topology validation failed: {e}"
+        
         # Save cache
         cache_file.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_file, 'wb') as f:
             pickle.dump({
                 'kin_system': kin_system,
                 'dof_cache': dof_cache,
+                'validation_result': validation_result,
                 'metadata': {
                     'sample_id': sample_id,
                     'n_protein_atoms': len(protein_atoms),
@@ -233,6 +336,13 @@ def process_single_sample(
                     'n_ligand_torsions': len(kin_system.ligand_torsion_defs),
                     'n_sidechain_dofs': len(kin_system.sidechain_torsion_defs),
                     'binding_site_cutoff': binding_site_cutoff,
+                    # KPFM metrics for filtering during training
+                    'kpfm_metrics': {
+                        'backbone_rmsd': result.get("backbone_rmsd"),
+                        'pocket_backbone_rmsd': result.get("pocket_rmsd"),
+                        'aligned_fraction': result.get("aligned_fraction"),
+                        'passes_filter': result.get("passes_kpfm_filter"),
+                    } if enable_topology_validation else None,
                 }
             }, f)
         
@@ -335,6 +445,10 @@ def main():
         max_chi_angles=args.max_chi_angles,
         include_sidechains=args.include_sidechains,
         overwrite=args.overwrite,
+        enable_topology_validation=args.enable_topology_validation,
+        kpfm_max_backbone_rmsd=args.kpfm_max_backbone_rmsd,
+        kpfm_max_pocket_rmsd=args.kpfm_max_pocket_rmsd,
+        kpfm_min_aligned_fraction=args.kpfm_min_aligned_fraction,
     )
     
     results = []
@@ -355,6 +469,13 @@ def main():
     total_lig_torsions = sum(r["n_ligand_torsions"] for r in results if r["success"])
     total_sc_dofs = sum(r["n_sidechain_dofs"] for r in results if r["success"])
     
+    # Topology validation statistics
+    n_topology_valid = sum(1 for r in results if r.get("topology_valid") == True)
+    n_passes_kpfm = sum(1 for r in results if r.get("passes_kpfm_filter") == True)
+    backbone_rmsds = [r["backbone_rmsd"] for r in results if r.get("backbone_rmsd") is not None]
+    pocket_rmsds = [r["pocket_rmsd"] for r in results if r.get("pocket_rmsd") is not None]
+    aligned_fracs = [r["aligned_fraction"] for r in results if r.get("aligned_fraction") is not None]
+    
     log.info(f"\n{'='*50}")
     log.info(f"DOF Cache Preprocessing Complete")
     log.info(f"{'='*50}")
@@ -363,6 +484,18 @@ def main():
     log.info(f"Failed: {n_failed}")
     log.info(f"Avg ligand torsions: {total_lig_torsions / max(n_success, 1):.1f}")
     log.info(f"Avg sidechain DOFs: {total_sc_dofs / max(n_success, 1):.1f}")
+    
+    # Topology validation summary
+    if args.enable_topology_validation and backbone_rmsds:
+        log.info(f"\n{'='*50}")
+        log.info(f"Topology Validation Summary")
+        log.info(f"{'='*50}")
+        log.info(f"Topology valid: {n_topology_valid}/{len(results)}")
+        log.info(f"Passes KPFM filter: {n_passes_kpfm}/{len(results)} ({100*n_passes_kpfm/len(results):.1f}%)")
+        log.info(f"Backbone RMSD: mean={np.mean(backbone_rmsds):.2f}Å, median={np.median(backbone_rmsds):.2f}Å")
+        log.info(f"Pocket RMSD: mean={np.mean(pocket_rmsds):.2f}Å, median={np.median(pocket_rmsds):.2f}Å")
+        log.info(f"Aligned fraction: mean={np.mean(aligned_fracs):.2%}, min={np.min(aligned_fracs):.2%}")
+    
     log.info(f"Output directory: {output_dir}")
     
     # Save summary
@@ -378,9 +511,51 @@ def main():
                 "binding_site_cutoff": args.binding_site_cutoff,
                 "max_chi_angles": args.max_chi_angles,
                 "include_sidechains": args.include_sidechains,
+                "kpfm_max_backbone_rmsd": args.kpfm_max_backbone_rmsd,
+                "kpfm_max_pocket_rmsd": args.kpfm_max_pocket_rmsd,
+                "kpfm_min_aligned_fraction": args.kpfm_min_aligned_fraction,
             },
             "failed_samples": [r["sample_id"] for r in results if not r["success"]],
         }, f, indent=2)
+    
+    # Save topology validation report
+    if args.save_topology_report and args.enable_topology_validation:
+        topology_report_file = output_dir / "topology_report.json"
+        topology_report = {
+            "summary": {
+                "total_samples": len(results),
+                "topology_valid": n_topology_valid,
+                "passes_kpfm_filter": n_passes_kpfm,
+                "kpfm_pass_rate": n_passes_kpfm / max(len(results), 1),
+                "mean_backbone_rmsd": float(np.mean(backbone_rmsds)) if backbone_rmsds else None,
+                "median_backbone_rmsd": float(np.median(backbone_rmsds)) if backbone_rmsds else None,
+                "mean_pocket_rmsd": float(np.mean(pocket_rmsds)) if pocket_rmsds else None,
+                "mean_aligned_fraction": float(np.mean(aligned_fracs)) if aligned_fracs else None,
+            },
+            "thresholds": {
+                "kpfm_max_backbone_rmsd": args.kpfm_max_backbone_rmsd,
+                "kpfm_max_pocket_rmsd": args.kpfm_max_pocket_rmsd,
+                "kpfm_min_aligned_fraction": args.kpfm_min_aligned_fraction,
+            },
+            "per_sample": [
+                {
+                    "sample_id": r["sample_id"],
+                    "topology_valid": r.get("topology_valid"),
+                    "passes_kpfm_filter": r.get("passes_kpfm_filter"),
+                    "backbone_rmsd": r.get("backbone_rmsd"),
+                    "pocket_rmsd": r.get("pocket_rmsd"),
+                    "aligned_fraction": r.get("aligned_fraction"),
+                }
+                for r in results if r.get("backbone_rmsd") is not None
+            ],
+            "filtered_out_samples": [
+                r["sample_id"] for r in results 
+                if r.get("passes_kpfm_filter") == False
+            ],
+        }
+        with open(topology_report_file, 'w') as f:
+            json.dump(topology_report, f, indent=2)
+        log.info(f"Topology report saved to: {topology_report_file}")
     
     log.info(f"Summary saved to: {summary_file}")
 

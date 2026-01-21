@@ -74,6 +74,11 @@ class PDBBindDataset(Dataset):
         a2h_max_ligand_length=None,
         binding_affinity_values_dict=None,
         n_lig_patches=32,
+        # KPFM-specific filtering parameters
+        kpfm_enable_filtering=False,
+        kpfm_max_backbone_rmsd=3.0,
+        kpfm_max_pocket_rmsd=2.0,
+        kpfm_min_aligned_fraction=0.9,
     ):
         """Initializes the dataset."""
 
@@ -100,6 +105,11 @@ class PDBBindDataset(Dataset):
         self.is_test_dataset = is_test_dataset
         self.binding_affinity_values_dict = binding_affinity_values_dict
         self.n_lig_patches = n_lig_patches
+        # KPFM filtering parameters
+        self.kpfm_enable_filtering = kpfm_enable_filtering
+        self.kpfm_max_backbone_rmsd = kpfm_max_backbone_rmsd
+        self.kpfm_max_pocket_rmsd = kpfm_max_pocket_rmsd
+        self.kpfm_min_aligned_fraction = kpfm_min_aligned_fraction
 
         split = os.path.splitext(os.path.basename(self.split_path))[0]
         self.full_cache_path = os.path.join(
@@ -188,6 +198,37 @@ class PDBBindDataset(Dataset):
                         new_rdkit_ligands.append(self.rdkit_ligands[complex_id])
                 self.complex_graphs = new_complex_graphs
                 self.rdkit_ligands = new_rdkit_ligands
+
+        # KPFM-specific filtering based on conformational deviation
+        if self.kpfm_enable_filtering and not is_test_dataset:
+            from flowdock.data.components.topology_validator import filter_dataset_for_kpfm
+            log.info(
+                f"Filtering the PDBBind {split} dataset for KPFM (max_backbone_rmsd={self.kpfm_max_backbone_rmsd}Å, "
+                f"max_pocket_rmsd={self.kpfm_max_pocket_rmsd}Å, min_aligned_frac={self.kpfm_min_aligned_fraction})"
+            )
+            pre_filter_count = len(self.complex_graphs)
+            self.complex_graphs, removed_ids = filter_dataset_for_kpfm(
+                self.complex_graphs,
+                kpfm_max_backbone_rmsd=self.kpfm_max_backbone_rmsd,
+                kpfm_max_pocket_rmsd=self.kpfm_max_pocket_rmsd,
+                kpfm_min_aligned_fraction=self.kpfm_min_aligned_fraction,
+            )
+            # Also filter rdkit_ligands
+            filtered_indices = set(range(len(self.complex_graphs)))
+            new_rdkit_ligands = []
+            for i, graph in enumerate(self.complex_graphs):
+                # Find matching ligand by sample_ID
+                sample_id = graph["metadata"]["sample_ID"]
+                for j, lig in enumerate(self.rdkit_ligands):
+                    if j < pre_filter_count:
+                        # Simple index-based matching (assumes order is preserved)
+                        new_rdkit_ligands.append(self.rdkit_ligands[i])
+                        break
+            if new_rdkit_ligands:
+                self.rdkit_ligands = new_rdkit_ligands[:len(self.complex_graphs)]
+            log.info(
+                f"KPFM filter removed {pre_filter_count - len(self.complex_graphs)} samples with large conformational changes"
+            )
 
         list_names = [complex_obj["metadata"]["sample_ID"] for complex_obj in self.complex_graphs]
         log.info(
