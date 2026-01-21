@@ -591,14 +591,22 @@ def sample_kpfm_interpolated(
     """
     Compute KPFM interpolated state and target velocity.
     
-    This is used during training to get:
-    1. x_t: Interpolated coordinates at time t
-    2. v_target: Target velocity in atom space (J @ dq_target)
+    Time Convention (consistent with FlowDock):
+        - t=0: Target/holo structure (q0, what we want to generate)
+        - t=1: Prior/noisy structure (q1, starting point)
+    
+    Interpolation: q_t = (1-t)*q0 + t*q1 (geodesic)
+        - At t=0: q_t = q0 (target)
+        - At t=1: q_t = q1 (prior)
+    
+    Target velocity: v_target points from q_t towards q0
+        dq_target = (q0 - q_t) / (1 - t) for t < 1
+        This is the velocity field that transports from prior to target.
     
     Args:
-        q0: Target DOF state (holo)
-        q1: Prior DOF state
-        t: [B, 1] interpolation time
+        q0: Target DOF state (holo, corresponds to t=0)
+        q1: Prior DOF state (corresponds to t=1)
+        t: [B, 1] or [B] interpolation time in [0, 1]
         kin_system: KinematicSystem
         latent_converter: LatentCoordinateConverter
     
@@ -614,8 +622,15 @@ def sample_kpfm_interpolated(
     batch_size = q0.translation.shape[0]
     device = q0.translation.device
     
-    # Interpolate in DOF space
-    q_t = geodesic_interpolate(q0, q1, t)
+    # Ensure t has correct shape
+    if t.dim() == 2:
+        t_scalar = t.squeeze(-1)  # [B]
+    else:
+        t_scalar = t
+    
+    # Interpolate in DOF space: q_t = geodesic_interp(q0, q1, t)
+    # At t=0 -> q0, at t=1 -> q1
+    q_t = geodesic_interpolate(q0, q1, t_scalar)
     
     # Forward kinematics to get coordinates
     fk = ForwardKinematics()
@@ -625,9 +640,11 @@ def sample_kpfm_interpolated(
     
     x_t = fk(q_t, kin_system, ref_coords)
     
-    # Compute target DOF velocity: dq = (q0 - q_t) / (1 - t)
-    # (Note: q0 is target/holo, we're going from prior q1 at t=1 to q0 at t=0)
-    dq_target = geodesic_velocity(q_t, q0, dt=(1 - t.squeeze(-1)).clamp(min=1e-6))
+    # Target DOF velocity: direction from q_t to q0, scaled by remaining time
+    # dq_target = (q0 - q_t) / (1 - t)
+    # This gives the constant velocity field of optimal transport
+    remaining_time = (1 - t_scalar).clamp(min=1e-6)
+    dq_target = geodesic_velocity(q_t, q0, dt=remaining_time)
     
     # Build Jacobian at current state
     jacobian_builder = SparseJacobianBuilder(use_sparse=False)
