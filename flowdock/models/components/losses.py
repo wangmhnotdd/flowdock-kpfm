@@ -558,6 +558,153 @@ def compute_lddt_pli(
     return lddt / 4
 
 
+# =============================================================================
+# KPFM Velocity Loss Functions
+# =============================================================================
+
+def compute_kpfm_velocity_loss(
+    v_pred: torch.Tensor,
+    v_target: torch.Tensor,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """
+    Compute KPFM velocity matching loss.
+    
+    The velocity target v_target = J(q_t) @ dq_target lies in the tangent space
+    of the kinematic manifold. This loss encourages the network's predicted
+    velocity to match this projected velocity.
+    
+    Args:
+        v_pred: Predicted velocity from network [B, 3N] or [B, 3N, 1]
+        v_target: Target velocity (J @ dq) [B, 3N] or [B, 3N, 1]
+        mask: Optional mask for valid atoms [B, N] or [B, 3N]
+        
+    Returns:
+        loss: Scalar velocity matching loss
+    """
+    # Flatten if needed
+    if v_pred.dim() == 3 and v_pred.shape[-1] == 1:
+        v_pred = v_pred.squeeze(-1)
+    if v_target.dim() == 3 and v_target.shape[-1] == 1:
+        v_target = v_target.squeeze(-1)
+    
+    # Compute per-component MSE
+    diff = (v_pred - v_target).square()
+    
+    if mask is not None:
+        # Expand mask to match velocity dimensions (3 per atom)
+        if mask.shape[-1] != v_pred.shape[-1]:
+            mask = mask.unsqueeze(-1).expand(-1, -1, 3).reshape(v_pred.shape[0], -1)
+        diff = diff * mask.float()
+        loss = diff.sum() / mask.float().sum().clamp(min=1.0)
+    else:
+        loss = diff.mean()
+    
+    return loss
+
+
+def compute_kpfm_dof_regularization_loss(
+    q_pred: "DOFState",
+    q_target: "DOFState",
+    translation_weight: float = 1.0,
+    rotation_weight: float = 1.0,
+    torsion_weight: float = 1.0,
+) -> torch.Tensor:
+    """
+    Compute regularization loss on DOF prediction.
+    
+    This optional loss directly supervises the DOF prediction to match
+    the target DOF, which can help with training stability.
+    
+    Args:
+        q_pred: Predicted DOF state
+        q_target: Target DOF state
+        translation_weight: Weight for translation loss
+        rotation_weight: Weight for rotation loss
+        torsion_weight: Weight for torsion angle loss
+        
+    Returns:
+        loss: Scalar DOF regularization loss
+    """
+    import math
+    
+    # Translation loss (simple MSE)
+    trans_loss = (q_pred.translation - q_target.translation).square().mean()
+    
+    # Rotation loss (geodesic on SO(3) via angle difference)
+    # Use wrapped angle difference
+    def angle_diff(a, b):
+        diff = a - b
+        return torch.remainder(diff + math.pi, 2 * math.pi) - math.pi
+    
+    rot_loss = angle_diff(q_pred.rotation, q_target.rotation).square().mean()
+    
+    # Torsion losses (wrapped angle difference)
+    lig_torsion_loss = angle_diff(
+        q_pred.ligand_torsions, q_target.ligand_torsions
+    ).square().mean()
+    sc_torsion_loss = angle_diff(
+        q_pred.sidechain_torsions, q_target.sidechain_torsions
+    ).square().mean()
+    
+    loss = (
+        translation_weight * trans_loss +
+        rotation_weight * rot_loss +
+        torsion_weight * (lig_torsion_loss + sc_torsion_loss) / 2
+    )
+    
+    return loss
+
+
+def compute_kpfm_manifold_projection_loss(
+    v_pred: torch.Tensor,
+    J: torch.Tensor,
+    damping: float = 1e-4,
+) -> torch.Tensor:
+    """
+    Compute loss measuring how well v_pred lies in the range of J.
+    
+    For perfect kinematic projection, v should satisfy v = J @ J^+ @ v.
+    This loss penalizes the component of v orthogonal to range(J).
+    
+    Args:
+        v_pred: Predicted velocity [B, 3N]
+        J: Jacobian matrix [B, 3N, M]
+        damping: Regularization for pseudo-inverse
+        
+    Returns:
+        loss: Scalar projection loss
+    """
+    batch_size = v_pred.shape[0]
+    
+    # Compute pseudo-inverse projection
+    # J^+ = (J^T J + lambda I)^{-1} J^T
+    JtJ = torch.bmm(J.transpose(1, 2), J)  # [B, M, M]
+    M = JtJ.shape[-1]
+    reg = damping * torch.eye(M, device=J.device).unsqueeze(0).expand(batch_size, -1, -1)
+    JtJ_reg = JtJ + reg
+    
+    # Solve for projection
+    v_expanded = v_pred.unsqueeze(-1)  # [B, 3N, 1]
+    Jtv = torch.bmm(J.transpose(1, 2), v_expanded)  # [B, M, 1]
+    
+    try:
+        dq = torch.linalg.solve(JtJ_reg, Jtv)  # [B, M, 1]
+    except:
+        # Fallback to pseudo-inverse if solve fails
+        JtJ_inv = torch.linalg.pinv(JtJ_reg)
+        dq = torch.bmm(JtJ_inv, Jtv)
+    
+    # Reconstruct projected velocity
+    v_proj = torch.bmm(J, dq).squeeze(-1)  # [B, 3N]
+    
+    # Loss is the orthogonal component
+    v_ortho = v_pred - v_proj
+    loss = v_ortho.square().mean()
+    
+    return loss
+
+
 def eval_structure_prediction_losses(
     lit_module: LightningModule,
     batch: MODEL_BATCH,

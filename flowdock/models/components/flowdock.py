@@ -44,6 +44,8 @@ from flowdock.models.components.noise import (
     sample_esmfold_prior,
     sample_gaussian_prior,
     sample_ligand_harmonic_prior,
+    sample_kpfm_prior,
+    sample_kpfm_interpolated,
 )
 from flowdock.models.components.transforms import (
     DefaultPLCoordinateConverter,
@@ -394,6 +396,35 @@ class FlowDock(torch.nn.Module):
                 noisy_x_int_0, noisy_x_int_1 = sample_esmfold_prior(
                     x_int_0_, x_int_1_, sigma=1e-4, x0_sigma=1e-4
                 )
+            elif self.prior_type == "kpfm":
+                # KPFM: Kinematic-Projected Flow Matching
+                # DOF space parameterization with forward kinematics reconstruction
+                kpfm_cfg = getattr(self.global_cfg, 'kpfm', None) or {}
+                translation_std = kpfm_cfg.get('translation_std', 5.0)
+                rotation_std = kpfm_cfg.get('rotation_std', 0.5)
+                
+                # Get kinematic system and DOF cache from batch
+                kin_system = batch.get('kpfm_kin_system')
+                dof_cache = batch.get('kpfm_dof_cache')
+                
+                if kin_system is None or dof_cache is None:
+                    log.warning("KPFM prior requested but kin_system/dof_cache not in batch. Falling back to harmonic prior.")
+                    noisy_x_int_0, noisy_x_int_1 = sample_complex_harmonic_prior(
+                        x_int_0_, latent_converter, batch, x0_sigma=1e-4
+                    )
+                else:
+                    noisy_x_int_0, noisy_x_int_1, q0, q1 = sample_kpfm_prior(
+                        x_int_0_,
+                        kin_system,
+                        dof_cache,
+                        latent_converter,
+                        translation_std=translation_std,
+                        rotation_std=rotation_std,
+                        x0_sigma=1e-4
+                    )
+                    # Store DOF states in batch for loss computation
+                    batch['kpfm_q0'] = q0
+                    batch['kpfm_q1'] = q1
             else:
                 raise NotImplementedError(f"Unsupported prior type: {self.prior_type}")
         except Exception as e:
@@ -476,6 +507,45 @@ class FlowDock(torch.nn.Module):
             dim=1,
         )
         return x_int
+
+    def forward_interp_kpfm(
+        self,
+        batch: MODEL_BATCH,
+        t: torch.Tensor,
+        latent_converter: LatentCoordinateConverter,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        KPFM-specific forward interpolation using DOF space.
+        
+        Computes interpolated coordinates and target velocity for KPFM training.
+        The velocity target is v_target = J(q_t) @ dq_target, which lies in the
+        tangent space of the kinematic manifold.
+        
+        Args:
+            batch: Batch dictionary containing kpfm_q0, kpfm_q1, and kpfm_kin_system
+            t: Normalized timestep [B, 1]
+            latent_converter: Coordinate converter
+            
+        Returns:
+            x_int_t: Interpolated latent coordinates [B, N, 3]
+            v_target: Target velocity in atom space [B, 3N, 1]
+        """
+        q0 = batch.get('kpfm_q0')
+        q1 = batch.get('kpfm_q1')
+        kin_system = batch.get('kpfm_kin_system')
+        
+        if q0 is None or q1 is None or kin_system is None:
+            raise ValueError("KPFM forward interpolation requires q0, q1, and kin_system in batch")
+        
+        # Compute interpolated state and target velocity
+        x_int_t, v_target = sample_kpfm_interpolated(
+            q0, q1, t, kin_system, latent_converter
+        )
+        
+        # Store velocity target in batch for loss computation
+        batch['kpfm_v_target'] = v_target
+        
+        return x_int_t, v_target
 
     def forward_interp_plcomplex_latinp(
         self,
@@ -1393,6 +1463,85 @@ class FlowDock(torch.nn.Module):
         """
         return clamp_tensor(1 - ((s / t) * eta)) * x0_hat + clamp_tensor((s / t) * eta) * xt
 
+    def reverse_interp_kpfm_step(
+        self,
+        v_pred: torch.Tensor,
+        q_t: Any,
+        t: torch.Tensor,
+        s: torch.Tensor,
+        kin_system: Any,
+        damping: float = 1e-4,
+    ) -> Any:
+        """
+        KPFM reverse sampling step using kinematic projection.
+        
+        Projects predicted velocity onto kinematic manifold via pseudo-inverse Jacobian,
+        then integrates DOF to get next state.
+        
+        Args:
+            v_pred: Predicted velocity in atom space [B, 3N] or [B, 3N, 1]
+            q_t: Current DOF state
+            t: Current timestep
+            s: Next timestep
+            kin_system: KinematicSystem object
+            damping: Damping for pseudo-inverse (regularization)
+            
+        Returns:
+            q_s: Updated DOF state at time s
+        """
+        from flowdock.models.components.kinematics import (
+            KinematicProjectionLayer, ForwardKinematics
+        )
+        from flowdock.data.components.dof_utils import DOFState
+        
+        batch_size = q_t.translation.shape[0]
+        device = q_t.translation.device
+        step_size = t - s
+        
+        # Flatten velocity if needed
+        if v_pred.dim() == 3 and v_pred.shape[-1] == 1:
+            v_pred = v_pred.squeeze(-1)
+        
+        # Get current coordinates via FK for Jacobian computation
+        fk = ForwardKinematics()
+        ref_coords = kin_system.reference_coords
+        if ref_coords.dim() == 2:
+            ref_coords = ref_coords.unsqueeze(0).expand(batch_size, -1, -1)
+        x_t = fk(q_t, kin_system, ref_coords)
+        
+        # Project velocity to DOF space: dq = J^+ @ v
+        proj_layer = KinematicProjectionLayer(damping=damping)
+        dq_flat = proj_layer(v_pred, x_t, kin_system)  # [B, M]
+        
+        # Convert to DOFState increment
+        n_trans = 3
+        n_rot = 3
+        n_lig_torsions = q_t.ligand_torsions.shape[-1]
+        n_sc_torsions = q_t.sidechain_torsions.shape[-1]
+        
+        dq_split = dq_flat.split([n_trans, n_rot, n_lig_torsions, n_sc_torsions], dim=-1)
+        dq = DOFState(
+            translation=dq_split[0],
+            rotation=dq_split[1],
+            ligand_torsions=dq_split[2],
+            sidechain_torsions=dq_split[3]
+        )
+        
+        # Euler integration: q_s = q_t + step_size * dq
+        # Note: For angles, we wrap to [-pi, pi]
+        import math
+        def wrap_angle(x):
+            return torch.remainder(x + math.pi, 2 * math.pi) - math.pi
+        
+        q_s = DOFState(
+            translation=q_t.translation + step_size * dq.translation,
+            rotation=wrap_angle(q_t.rotation + step_size * dq.rotation),
+            ligand_torsions=wrap_angle(q_t.ligand_torsions + step_size * dq.ligand_torsions),
+            sidechain_torsions=wrap_angle(q_t.sidechain_torsions + step_size * dq.sidechain_torsions)
+        )
+        
+        return q_s
+
     def reverse_interp_plcomplex_latinp(
         self,
         batch: MODEL_BATCH,
@@ -1968,6 +2117,249 @@ class FlowDock(torch.nn.Module):
                 "receptor_padded": mean_x2_padded,
             }
         )
+        return ret
+
+    def sample_pl_complex_structures_kpfm(
+        self,
+        batch: MODEL_BATCH,
+        num_steps: int = 100,
+        return_summary_stats: bool = False,
+        return_all_states: bool = False,
+        start_time: float = 1.0,
+        align_to_ground_truth: bool = True,
+        use_template: Optional[bool] = None,
+        damping: float = 1e-4,
+        **kwargs,
+    ) -> MODEL_BATCH:
+        """
+        Sample protein-ligand complex structures using KPFM kinematic sampling.
+        
+        This method performs sampling in DOF space, using kinematic projection
+        to ensure generated structures satisfy geometric constraints.
+        
+        Args:
+            batch: Batch dictionary containing kpfm_kin_system, kpfm_dof_cache
+            num_steps: Number of integration steps
+            return_summary_stats: Return only metrics
+            return_all_states: Return intermediate states
+            start_time: Starting time (1.0 = full prior)
+            align_to_ground_truth: Align final structure to ground truth
+            use_template: Use template protein structure
+            damping: Damping factor for pseudo-inverse
+            
+        Returns:
+            Dictionary with sampled structures and metrics
+        """
+        from flowdock.models.components.kinematics import ForwardKinematics
+        from flowdock.data.components.dof_utils import sample_dof_prior, DOFState
+        
+        assert num_steps > 0, "Invalid number of steps."
+        assert 0.0 <= start_time <= 1.0, "Invalid start time."
+        if use_template is None:
+            use_template = self.global_cfg.use_template
+
+        features = batch["features"]
+        indexer = batch["indexer"]
+        metadata = batch["metadata"]
+        res_atom_mask = batch["features"]["res_atom_mask"].bool()
+        device = features["res_type"].device
+        batch_size = metadata["num_structid"]
+
+        # Get KPFM-specific data
+        kin_system = batch.get('kpfm_kin_system')
+        dof_cache = batch.get('kpfm_dof_cache')
+        
+        if kin_system is None or dof_cache is None:
+            log.warning("KPFM sampling requires kpfm_kin_system and kpfm_dof_cache. Falling back to standard sampling.")
+            return self.sample_pl_complex_structures(
+                batch, num_steps, return_summary_stats, return_all_states,
+                start_time=start_time, align_to_ground_truth=align_to_ground_truth,
+                use_template=use_template, **kwargs
+            )
+
+        if "num_molid" in batch["metadata"].keys() and batch["metadata"]["num_molid"] > 0:
+            batch["misc"]["protein_only"] = False
+        else:
+            batch["misc"]["protein_only"] = True
+
+        # Get KPFM config
+        kpfm_cfg = getattr(self.global_cfg, 'kpfm', None) or {}
+        translation_std = kpfm_cfg.get('translation_std', 5.0)
+        rotation_std = kpfm_cfg.get('rotation_std', 0.5)
+
+        with torch.no_grad():
+            # Initialize DOF state from prior
+            q_t = sample_dof_prior(
+                batch_size=batch_size,
+                kin_system=kin_system,
+                translation_std=translation_std,
+                rotation_std=rotation_std,
+                device=device,
+                dtype=features["res_type"].dtype if hasattr(features["res_type"], 'dtype') else torch.float32
+            )
+            
+            # Initialize FK
+            fk = ForwardKinematics()
+            ref_coords = kin_system.reference_coords
+            if ref_coords.dim() == 2:
+                ref_coords = ref_coords.unsqueeze(0).expand(batch_size, -1, -1)
+
+            if return_all_states:
+                all_frames = []
+                x_init = fk(q_t, kin_system, ref_coords)
+                all_frames.append({
+                    "coords": x_init.cpu(),
+                    "q": q_t,
+                })
+
+            # Reverse sampling loop
+            schedule = torch.linspace(start_time, 0, num_steps + 1, device=device)
+            
+            for t, s in tqdm.tqdm(
+                zip(schedule[:-1], schedule[1:]), 
+                desc="KPFM Structure generation"
+            ):
+                # Get current coordinates via FK
+                x_t = fk(q_t, kin_system, ref_coords)
+                
+                # Convert to latent for network input
+                latent_converter = self.resolve_latent_converter(
+                    [("features", "res_atom_positions"), ("features", "input_protein_coords")],
+                    [("features", "sdf_coordinates"), ("features", "input_ligand_coords")],
+                )
+                
+                # Update batch with current coordinates
+                batch["features"]["input_protein_coords"] = x_t[:, kin_system.protein_mask]
+                if not batch["misc"]["protein_only"]:
+                    batch["features"]["input_ligand_coords"] = x_t[:, kin_system.ligand_mask]
+                
+                # Assign timestep encoding
+                self.assign_timestep_encodings(batch, t)
+                
+                # Forward pass to get velocity prediction
+                batch = self.forward(
+                    batch,
+                    contact_prediction=True,
+                    score=True,
+                    use_template=use_template,
+                    training=False,
+                )
+                
+                # Extract predicted velocity from denoised prediction
+                pred_prot = batch["outputs"]["denoised_prediction"]["final_coords_prot_atom_padded"]
+                pred_lig = batch["outputs"]["denoised_prediction"].get("final_coords_lig_atom")
+                
+                # Compute velocity as (x0_hat - x_t) / t  (where x0_hat is denoised prediction)
+                x_t_prot = batch["features"]["input_protein_coords"]
+                v_pred_prot = (pred_prot - x_t_prot) / t.clamp(min=1e-6)
+                
+                if pred_lig is not None and not batch["misc"]["protein_only"]:
+                    x_t_lig = batch["features"]["input_ligand_coords"]
+                    v_pred_lig = (pred_lig - x_t_lig) / t.clamp(min=1e-6)
+                    # Combine into full velocity
+                    v_pred = torch.zeros(batch_size, kin_system.n_atoms, 3, device=device)
+                    v_pred[:, kin_system.protein_mask] = v_pred_prot.view(batch_size, -1, 3)
+                    v_pred[:, kin_system.ligand_mask] = v_pred_lig.view(batch_size, -1, 3)
+                else:
+                    v_pred = v_pred_prot.view(batch_size, -1, 3)
+                
+                # Flatten velocity for projection
+                v_pred_flat = v_pred.view(batch_size, -1)  # [B, 3N]
+                
+                # KPFM step: project velocity and integrate DOF
+                q_t = self.reverse_interp_kpfm_step(
+                    v_pred_flat, q_t, t, s, kin_system, damping=damping
+                )
+                
+                if return_all_states:
+                    x_new = fk(q_t, kin_system, ref_coords)
+                    all_frames.append({
+                        "coords": x_new.cpu(),
+                        "q": q_t,
+                    })
+
+            # Final coordinates
+            final_coords = fk(q_t, kin_system, ref_coords)
+            
+            # Extract protein and ligand coordinates
+            mean_x2 = final_coords[:, kin_system.protein_mask].reshape(-1, 3)
+            mean_x2_padded = batch["features"]["res_atom_positions"].clone()
+            mean_x2_padded[res_atom_mask] = mean_x2
+            
+            if not batch["misc"]["protein_only"]:
+                mean_x1 = final_coords[:, kin_system.ligand_mask].reshape(-1, 3)
+            else:
+                mean_x1 = None
+
+            # Compute metrics
+            if align_to_ground_truth:
+                similarity_transform = corresponding_points_alignment(
+                    mean_x2_padded[:, 1].view(batch_size, -1, 3),
+                    batch["features"]["res_atom_positions"][:, 1].view(batch_size, -1, 3),
+                    estimate_scale=False,
+                )
+                mean_x2 = (
+                    apply_similarity_transform(
+                        mean_x2.view(batch_size, -1, 3), *similarity_transform
+                    )
+                    .contiguous()
+                    .flatten(0, 1)
+                )
+                mean_x2_padded[res_atom_mask] = mean_x2
+                if mean_x1 is not None:
+                    mean_x1 = (
+                        apply_similarity_transform(
+                            mean_x1.view(batch_size, -1, 3), *similarity_transform
+                        )
+                        .contiguous()
+                        .flatten(0, 1)
+                    )
+
+            # Compute structural metrics
+            protein_fape, _ = compute_fape_from_atom37(
+                batch, device, mean_x2_padded, batch["features"]["res_atom_positions"]
+            )
+            tm_lbound = compute_TMscore_lbound(
+                batch, mean_x2_padded, batch["features"]["res_atom_positions"]
+            )
+            lddt_ca = compute_lddt_ca(
+                batch, mean_x2_padded, batch["features"]["res_atom_positions"]
+            )
+            
+            ret = {
+                "FAPE_protein": protein_fape,
+                "TM_lbound": tm_lbound,
+                "lDDT-Ca": lddt_ca,
+                "final_dof_state": q_t,
+            }
+
+            if mean_x1 is not None:
+                # Compute ligand metrics
+                coords_pred_lig = mean_x1.view(batch_size, -1, 3)
+                coords_ref_lig = batch["features"]["sdf_coordinates"].view(batch_size, -1, 3)
+                coords_pred_prot = mean_x2_padded[res_atom_mask].view(batch_size, -1, 3)
+                coords_ref_prot = batch["features"]["res_atom_positions"][res_atom_mask].view(batch_size, -1, 3)
+                
+                lig_rmsd = (
+                    (coords_pred_lig - coords_pred_prot.mean(dim=1, keepdim=True))
+                    - (coords_ref_lig - coords_ref_prot.mean(dim=1, keepdim=True))
+                ).square().sum(dim=-1).mean(dim=-1).sqrt()
+                
+                ret.update({
+                    "ligand_RMSD": lig_rmsd,
+                })
+
+        if return_summary_stats:
+            return ret
+
+        if return_all_states:
+            ret.update({"all_frames": all_frames})
+
+        ret.update({
+            "ligands": mean_x1,
+            "receptor": mean_x2,
+            "receptor_padded": mean_x2_padded,
+        })
         return ret
 
     def forward(

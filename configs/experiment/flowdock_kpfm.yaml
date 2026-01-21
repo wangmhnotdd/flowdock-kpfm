@@ -1,0 +1,50 @@
+# @package _global_
+
+# KPFM: Kinematic-Projected Flow Matching
+# Fine-tuning FlowDock with DOF-space flow matching and kinematic constraints
+#
+# To execute this experiment run:
+# python train.py experiment=flowdock_kpfm
+
+defaults:
+  - override /data: combined
+  - override /model: flowdock_kpfm
+  - override /callbacks: default
+  - override /trainer: default
+
+tags: ["flowdock_kpfm", "kinematic_flow_matching", "dof_space"]
+
+seed: 496
+
+trainer:
+  max_epochs: 100  # Fine-tuning typically needs fewer epochs
+  check_val_every_n_epoch: 5
+  reload_dataloaders_every_n_epochs: 1
+  # For 4xA100 40G
+  devices: 4
+  accelerator: gpu
+  strategy: ddp_find_unused_parameters_true  # Needed for KPFM projection layers
+  precision: 16-mixed  # Use AMP for memory efficiency
+
+model:
+  optimizer:
+    lr: 5e-5  # Lower LR for fine-tuning
+  compile: false
+
+data:
+  batch_size: 8  # Reduced due to Jacobian computation memory overhead
+  num_workers: 4
+
+logger:
+  wandb:
+    tags: ${tags}
+    group: "FlowDock-KPFM"
+    name: "kpfm_finetune"
+
+# Gradient checkpointing for memory efficiency
+callbacks:
+  model_checkpoint:
+    monitor: "val/tm_lbound"
+    mode: "max"
+    save_top_k: 3
+    filename: "epoch_{epoch:03d}-tm_{val/tm_lbound:.4f}"

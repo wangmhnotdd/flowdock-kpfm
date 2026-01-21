@@ -441,3 +441,203 @@ def sample_esmfold_prior(
     """
     prior_noise = torch.randn_like(x0)
     return x0 + prior_noise * x0_sigma, x1 + prior_noise * sigma
+
+
+# =============================================================================
+# KPFM Prior Sampling
+# =============================================================================
+
+def sample_kpfm_prior(
+    x0: torch.Tensor,
+    kin_system: Any,
+    dof_cache: Any,
+    latent_converter: Any,
+    translation_std: float = 5.0,
+    rotation_std: float = 0.5,
+    x0_sigma: float = 1e-4,
+) -> Tuple[torch.Tensor, torch.Tensor, Any, Any]:
+    """
+    Sample from KPFM prior distribution in DOF space.
+    
+    This is the core KPFM prior that samples in DOF space and reconstructs
+    coordinates using forward kinematics, ensuring all geometric constraints
+    (bond lengths, angles) are maintained.
+    
+    Args:
+        x0: [B, N_latent, 3] ground-truth latent coordinates (holo structure)
+        kin_system: KinematicSystem object
+        dof_cache: CachedDOFData with target DOF and torsion definitions
+        latent_converter: LatentCoordinateConverter for coordinate transforms
+        translation_std: Std for ligand translation prior (Angstroms)
+        rotation_std: Std for ligand rotation prior (radians)
+        x0_sigma: Small noise to add to ground-truth
+    
+    Returns:
+        noisy_x0: Ground-truth with small additive noise
+        x1: Prior sample reconstructed via FK
+        q0: Target DOF state
+        q1: Prior DOF state
+    """
+    from flowdock.data.components.dof_utils import sample_dof_prior, DOFState
+    from flowdock.models.components.kinematics import ForwardKinematics
+    
+    batch_size = x0.shape[0]
+    device = x0.device
+    dtype = x0.dtype
+    
+    # Add small noise to ground-truth
+    gaussian_noise = torch.randn_like(x0)
+    noisy_x0 = x0 + gaussian_noise * x0_sigma
+    
+    # Get target DOF state from cache
+    q0 = dof_cache.target_dof
+    if q0.translation.shape[0] == 1 and batch_size > 1:
+        # Expand to batch
+        q0 = DOFState(
+            translation=q0.translation.expand(batch_size, -1).clone(),
+            rotation=q0.rotation.expand(batch_size, -1).clone(),
+            ligand_torsions=q0.ligand_torsions.expand(batch_size, -1).clone(),
+            sidechain_torsions=q0.sidechain_torsions.expand(batch_size, -1).clone()
+        )
+    q0 = q0.to(device)
+    
+    # Sample prior DOF state
+    q1 = sample_dof_prior(
+        batch_size=batch_size,
+        kin_system=kin_system,
+        translation_std=translation_std,
+        rotation_std=rotation_std,
+        device=device,
+        dtype=dtype
+    )
+    
+    # Reconstruct prior coordinates via forward kinematics
+    fk = ForwardKinematics()
+    
+    # Get reference coordinates from kinematic system
+    ref_coords = kin_system.reference_coords
+    if ref_coords.dim() == 2:
+        ref_coords = ref_coords.unsqueeze(0)
+    if ref_coords.shape[0] == 1 and batch_size > 1:
+        ref_coords = ref_coords.expand(batch_size, -1, -1)
+    
+    # Apply FK to get prior coordinates
+    x1_coords = fk(q1, kin_system, ref_coords)  # [B, N, 3]
+    
+    # Convert back to latent space (normalize by scales)
+    # NOTE: This assumes DefaultPLCoordinateConverter
+    x1 = coords_to_latent(x1_coords, kin_system, latent_converter)
+    
+    return noisy_x0, x1, q0, q1
+
+
+def coords_to_latent(
+    coords: torch.Tensor,
+    kin_system: Any,
+    latent_converter: Any
+) -> torch.Tensor:
+    """
+    Convert flat coordinates to latent representation.
+    
+    Args:
+        coords: [B, N, 3] Cartesian coordinates
+        kin_system: KinematicSystem with masks
+        latent_converter: LatentCoordinateConverter with scales
+    
+    Returns:
+        latent: [B, N_latent, 3] latent coordinates (normalized)
+    """
+    batch_size = coords.shape[0]
+    device = coords.device
+    
+    lig_mask = kin_system.ligand_mask
+    prot_mask = kin_system.protein_mask
+    
+    # Separate ligand and protein
+    lig_coords = coords[:, lig_mask]  # [B, N_lig, 3]
+    prot_coords = coords[:, prot_mask]  # [B, N_prot, 3]
+    
+    # Compute centroids for normalization
+    if lig_coords.shape[1] > 0:
+        centroid = lig_coords.mean(dim=1, keepdim=True)  # [B, 1, 3]
+    else:
+        centroid = prot_coords.mean(dim=1, keepdim=True)
+    
+    # Center coordinates
+    lig_coords_centered = lig_coords - centroid
+    prot_coords_centered = prot_coords - centroid
+    
+    # Normalize by scales
+    ca_scale = latent_converter.ca_scale
+    other_scale = latent_converter.other_scale
+    
+    # For simplicity, treat ligand as "other" scale
+    lig_latent = lig_coords_centered / other_scale
+    prot_latent = prot_coords_centered / ca_scale  # Simplified
+    
+    # Concatenate in expected order
+    latent = torch.cat([prot_latent, lig_latent], dim=1)
+    
+    return latent
+
+
+def sample_kpfm_interpolated(
+    q0: Any,
+    q1: Any,
+    t: torch.Tensor,
+    kin_system: Any,
+    latent_converter: Any
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Compute KPFM interpolated state and target velocity.
+    
+    This is used during training to get:
+    1. x_t: Interpolated coordinates at time t
+    2. v_target: Target velocity in atom space (J @ dq_target)
+    
+    Args:
+        q0: Target DOF state (holo)
+        q1: Prior DOF state
+        t: [B, 1] interpolation time
+        kin_system: KinematicSystem
+        latent_converter: LatentCoordinateConverter
+    
+    Returns:
+        x_t: [B, N_latent, 3] interpolated latent coordinates
+        v_target: [B, 3N, 1] target velocity in atom space
+    """
+    from flowdock.data.components.dof_utils import geodesic_interpolate, geodesic_velocity
+    from flowdock.models.components.kinematics import (
+        ForwardKinematics, SparseJacobianBuilder
+    )
+    
+    batch_size = q0.translation.shape[0]
+    device = q0.translation.device
+    
+    # Interpolate in DOF space
+    q_t = geodesic_interpolate(q0, q1, t)
+    
+    # Forward kinematics to get coordinates
+    fk = ForwardKinematics()
+    ref_coords = kin_system.reference_coords
+    if ref_coords.dim() == 2:
+        ref_coords = ref_coords.unsqueeze(0).expand(batch_size, -1, -1)
+    
+    x_t = fk(q_t, kin_system, ref_coords)
+    
+    # Compute target DOF velocity: dq = (q0 - q_t) / (1 - t)
+    # (Note: q0 is target/holo, we're going from prior q1 at t=1 to q0 at t=0)
+    dq_target = geodesic_velocity(q_t, q0, dt=(1 - t.squeeze(-1)).clamp(min=1e-6))
+    
+    # Build Jacobian at current state
+    jacobian_builder = SparseJacobianBuilder(use_sparse=False)
+    J = jacobian_builder(x_t, kin_system, return_sparse=False)  # [B, 3N, M]
+    
+    # Target velocity in atom space: v = J @ dq
+    dq_flat = dq_target.to_flat().unsqueeze(-1)  # [B, M, 1]
+    v_target = torch.bmm(J, dq_flat)  # [B, 3N, 1]
+    
+    # Convert x_t to latent
+    x_t_latent = coords_to_latent(x_t, kin_system, latent_converter)
+    
+    return x_t_latent, v_target

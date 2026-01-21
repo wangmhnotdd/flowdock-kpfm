@@ -1,0 +1,195 @@
+# FlowDock with KPFM (Kinematic-Projected Flow Matching)
+# This model uses DOF-space parameterization with kinematic constraints
+
+_target_: flowdock.models.flowdock_fm_module.FlowDockFMLitModule
+
+net:
+  _target_: flowdock.models.components.flowdock.FlowDock
+  _partial_: true
+
+optimizer:
+  _target_: torch.optim.AdamW  # Use AdamW for better regularization
+  _partial_: true
+  lr: 5e-5  # Lower LR for fine-tuning
+  weight_decay: 0.01
+  betas: [0.9, 0.999]
+
+scheduler:
+  _target_: torch.optim.lr_scheduler.CosineAnnealingWarmRestarts
+  _partial_: true
+  T_0: ${int_divide:${trainer.max_epochs},10}
+  T_mult: 2
+  eta_min: 1e-7
+  verbose: true
+
+# compile model for faster training with pytorch 2.0
+compile: false
+
+# model arguments
+cfg:
+  mol_encoder:
+    node_channels: 512
+    pair_channels: 64
+    n_atom_encodings: 23
+    n_bond_encodings: 4
+    n_atom_pos_encodings: 6
+    n_stereo_encodings: 14
+    n_attention_heads: 8
+    attention_head_dim: 8
+    hidden_dim: 2048
+    max_path_integral_length: 6
+    n_transformer_stacks: 8
+    n_heads: 8
+    n_patches: ${data.n_lig_patches}
+    checkpoint_file: ${oc.env:PROJECT_ROOT}/checkpoints/neuralplexermodels_downstream_datasets_predictions/models/complex_structure_prediction.ckpt
+    megamolbart: null
+    from_pretrained: true
+
+  protein_encoder:
+    use_esm_embedding: true
+    esm_version: esm2_t33_650M_UR50D
+    esm_repr_layer: 33
+    residue_dim: 512
+    plm_embed_dim: 1280
+    n_aa_types: 21
+    atom_padding_dim: 37
+    n_atom_types: 4 # [C, N, O, S]
+    n_patches: ${data.n_protein_patches}
+    n_attention_heads: 8
+    scalar_dim: 16
+    point_dim: 4
+    pair_dim: 64
+    n_heads: 8
+    head_dim: 8
+    max_residue_degree: 32
+    n_encoder_stacks: 2
+    from_pretrained: true
+
+  relational_reasoning:
+    from_pretrained: true
+
+  contact_predictor:
+    n_stacks: 4
+    dropout: 0.01
+    from_pretrained: true
+
+  score_head:
+    fiber_dim: 64
+    hidden_dim: 512
+    n_stacks: 4
+    max_atom_degree: 8
+    from_pretrained: true
+
+  confidence:
+    enabled: true
+    fiber_dim: ${..score_head.fiber_dim}
+    hidden_dim: ${..score_head.hidden_dim}
+    n_stacks: ${..score_head.n_stacks}
+    from_pretrained: true
+
+  affinity:
+    enabled: true
+    fiber_dim: ${..score_head.fiber_dim}
+    hidden_dim: ${..score_head.hidden_dim}
+    n_stacks: ${..score_head.n_stacks}
+    ligand_pooling: sum
+    dropout: 0.01
+    from_pretrained: false
+
+  latent_model: default
+  
+  # KPFM prior type - uses DOF space flow matching
+  prior_type: kpfm
+
+  task:
+    pretrained: null
+    ligands: true
+    epoch_frac: ${data.epoch_frac}
+    label_name: null
+    sequence_crop_size: 1600
+    edge_crop_size: ${data.edge_crop_size}
+    max_masking_rate: 0.0
+    n_modes: 8
+    dropout: 0.01
+    
+    # Freeze most pretrained components, only fine-tune score head
+    freeze_mol_encoder: true
+    freeze_protein_encoder: true
+    freeze_relational_reasoning: true
+    freeze_contact_predictor: true
+    freeze_score_head: false  # Fine-tune score head for KPFM
+    freeze_confidence: true
+    freeze_affinity: true
+    
+    use_template: true
+    use_plddt: false
+    block_contact_decoding_scheme: "beam"
+    frozen_ligand_backbone: false
+    frozen_protein_backbone: false
+    single_protein_batch: true
+    
+    # Loss weights
+    contact_loss_weight: 0.0  # Freeze contact prediction
+    global_score_loss_weight: 0.2
+    ligand_score_loss_weight: 0.1
+    clash_loss_weight: 10.0
+    local_distgeom_loss_weight: 10.0
+    drmsd_loss_weight: 2.0
+    distogram_loss_weight: 0.0  # Freeze distogram
+    plddt_loss_weight: 0.0  # Freeze pLDDT
+    affinity_loss_weight: 0.0  # Freeze affinity
+    aux_batch_freq: 10
+    global_max_sigma: 5.0
+    internal_max_sigma: 2.0
+    detect_covalent: true
+    
+    # KPFM-specific loss weights
+    kpfm_velocity_loss_weight: 1.0  # Weight for velocity matching loss
+    kpfm_projection_loss_weight: 0.1  # Weight for manifold projection loss
+    kpfm_dof_reg_weight: 0.01  # Weight for DOF regularization
+    
+    # Runtime configs
+    float32_matmul_precision: highest
+    constrained_inpainting: false
+    visualize_generated_samples: true
+    
+    # Sampling configs
+    loss_mode: structure_prediction
+    num_steps: 50  # More steps for KPFM sampling
+    sampler: KPFM  # Use KPFM sampler
+    sampler_eta: 1.0
+    start_time: 1.0
+    eval_structure_prediction: true
+    
+    # Overfitting configs
+    overfitting_example_name: ${data.overfitting_example_name}
+    
+    # KPFM-specific parameters
+    kpfm:
+      # Prior sampling parameters
+      translation_std: 5.0  # Angstroms - std for ligand translation prior
+      rotation_std: 0.5  # Radians - std for ligand rotation prior
+      torsion_std: 3.14159  # Radians - std for torsion angle prior (uniform over [-pi, pi])
+      
+      # Jacobian computation
+      damping: 1e-4  # Damping factor for pseudo-inverse
+      use_sparse: true  # Use sparse Jacobian for large proteins
+      sparse_threshold: 500  # Use sparse above this many atoms
+      
+      # Sidechain handling
+      include_sidechains: true  # Include sidechain chi angles in DOF
+      max_chi_angles: 4  # Max chi angles per residue
+      binding_site_only: true  # Only model sidechains in binding site
+      binding_site_cutoff: 6.0  # Angstroms
+      
+      # DOF cache
+      use_dof_cache: true  # Pre-compute DOF data
+      dof_cache_dir: ${oc.env:PROJECT_ROOT}/data/dof_cache
+      
+      # Numerical stability
+      min_step_size: 1e-6
+      max_dof_velocity: 10.0  # Clamp DOF velocities for stability
+      
+      # Memory optimization for large proteins
+      chunk_size: 1000  # Process atoms in chunks for Jacobian
+      gradient_checkpointing: true
